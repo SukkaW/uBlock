@@ -1,5 +1,23 @@
-let handler = () => {};
-self.onmessage = e => handler(e);
+let genuid = () => {
+	return [...Array(16)].reduce(a => a + Math.random().toString(36)[2], '')
+};
+
+const EPOCH = genuid();
+
+let resolveReady;
+let ready = new Promise(r => { resolveReady = r; });
+let connected = false;
+
+self.onmessage = e => {
+	const msg = e.data;
+	if (msg.type === "beat") {
+		e.source.postMessage({ type: "beat", epoch: EPOCH });
+	} else if (msg.type === "port") {
+		console.log("OFFSCREEN CONNECTED");
+		connected = true;
+		resolveReady(msg.port);
+	}
+};
 
 async function createOffscreen() {
 	const offscreenUrl = chrome.runtime.getURL("/offscreen.html");
@@ -13,25 +31,28 @@ async function createOffscreen() {
 	} else {
 		console.log("OFFSCREEN ALIVE");
 	}
-	return new Promise(r => {
-		handler = e => {
-			if (e.data.type === "init") {
-				console.log("OFFSCREEN CONTACTED");
-				e.source.postMessage({ type: "ready" });
-				setInterval(() => e.source.postMessage({ type: "ping" }), 1000);
-			} else if (e.data.type === "port") {
-				console.log("OFFSCREEN CONNECTED");
-				r(e.data.port);
-			}
-		}
-	})
 }
 
-let genuid = () => {
-	return [...Array(16)].reduce(a => a + Math.random().toString(36)[2], '')
-};
+const PING_INTERVAL = 100;
+const PING_TIMEOUT = 5000;
 
-let ready = createOffscreen();
+async function pingOffscreen() {
+	const offscreenUrl = chrome.runtime.getURL("/offscreen.html");
+	for (let elapsed = 0; !connected && elapsed < PING_TIMEOUT; elapsed += PING_INTERVAL) {
+		const clients = await self.clients.matchAll({ includeUncontrolled: true });
+		for (const client of clients) {
+			if (client.url !== offscreenUrl) { continue; }
+			try { client.postMessage({ type: "beat", epoch: EPOCH }); } catch {}
+		}
+		await new Promise(r => setTimeout(r, PING_INTERVAL));
+	}
+}
+
+async function start() {
+	await createOffscreen();
+	await pingOffscreen();
+}
+start();
 
 class Worker extends EventTarget {
 	build(port, args) {
