@@ -30,6 +30,14 @@ import { safeReplace } from './safe-replace.js';
 
 /******************************************************************************/
 
+const browser = (self.browser || self.chrome);
+
+const resourceTypes = await browser.runtime.sendMessage({
+    what: 'compileFilters:getResourceTypes'
+});
+
+/******************************************************************************/
+
 function parseExpires(s) {
     const matches = s.match(/(\d+)\s*([wdhm]?)/i);
     if ( matches === null ) { return; }
@@ -95,12 +103,12 @@ function compileScriptletFilter(parser, output) {
             continue;
         }
         details.matches ??= [];
-        if ( details.matches.includes('*') ) { continue; }
-        if ( hn === '*' ) {
+        if ( details.matches[0] === '*' ) { continue; }
+        if ( hn !== '*' ) {
+            details.matches.push(hn);
+        } else if ( parser.options.trustedSource ) {
             details.matches = [ '*' ];
-            continue;
         }
-        details.matches.push(hn);
     }
 }
 
@@ -117,7 +125,12 @@ export function compileCosmeticFilter(parser, output) {
         if ( not && exception ) { continue; }
         if ( not || exception ) {
             excludeMatches.push(hn);
-        } else if ( hn !== '*' ) {
+        } else if ( hn === '*' ) {
+            if ( parser.options.trustedSource !== true ) { continue; }
+            matches.length = 0;
+            matches.push('*');
+        } else {
+            if ( matches[0] === '*' ) { continue; }
             matches.push(hn);
         }
     }
@@ -184,7 +197,9 @@ export function compileFilters(listid, text, context = {}) {
         }
         if ( parser.isNetworkFilter() ) {
             filterStats.total += 1;
-            const rule = parseNetworkFilter(parser);
+            const rule = parseNetworkFilter(parser, {
+                resourceTypes,
+            });
             if ( rule ) {
                 unminimizedRules.push(rule);
                 filterStats.accepted += 1;
@@ -233,7 +248,8 @@ export async function toMv3Data(rulesetid, compiledData) {
         const result = makeScriptlets.commit(rulesetid, template);
         if ( result.ISOLATED ) {
             const { hasRegexes, hasAncestors, hasEntities } = result.ISOLATED;
-            const hostnames = hasRegexes || hasAncestors || hasEntities
+            const hostnames = hasRegexes || hasAncestors || hasEntities ||
+                result.ISOLATED.hostnames.includes('*')
                 ? '*'
                 : result.ISOLATED.hostnames;
             isolated.push({
@@ -244,7 +260,8 @@ export async function toMv3Data(rulesetid, compiledData) {
         }
         if ( result.MAIN ) {
             const { hasRegexes, hasAncestors, hasEntities } = result.MAIN;
-            const hostnames = hasRegexes || hasAncestors || hasEntities
+            const hostnames = hasRegexes || hasAncestors || hasEntities ||
+                result.MAIN.hostnames.includes('*')
                 ? '*'
                 : result.MAIN.hostnames;
             main.push({
@@ -317,7 +334,9 @@ async function updateList(list) {
         ],
     };
     const asset = { urls: [ list.id ] };
-    const text = await fetchList(context, asset);
+    const text = await fetchList(context, asset, ( ) => {
+        browser.runtime.sendMessage({ what: 'keepAlive' });
+    });
     if ( Boolean(text) === false ) { return; }
 
     const metadata = extractMetadataFromList(text, [
@@ -334,7 +353,7 @@ async function updateList(list) {
     });
     if ( Boolean(compiled) === false ) { return; }
 
-    await chrome.runtime.sendMessage({
+    await browser.runtime.sendMessage({
         what: 'compileFilters:updateImportedListData',
         listid: list.id,
         compiled: s14e.serialize(compiled, { compress: true }),
@@ -351,7 +370,7 @@ async function updateList(list) {
 /******************************************************************************/
 
 async function getCompiledListData(list) {
-    const result = await chrome.runtime.sendMessage({
+    const result = await browser.runtime.sendMessage({
         what: 'compileFilters:getImportedListCompiledData',
         listid: list.id,
     });
@@ -423,7 +442,7 @@ function mergeCompiledData(to, from) {
 /******************************************************************************/
 
 async function compileImportedList() {
-    const lists = await chrome.runtime.sendMessage({
+    const lists = await browser.runtime.sendMessage({
         what: 'compileFilters:getEnabledImportedLists'
     });
     if ( Boolean(lists?.length) === false ) { return; }
@@ -433,7 +452,7 @@ async function compileImportedList() {
         promises.push(getCompiledListData(list));
     }
     const compiledData = await Promise.all(promises);
-    const toMerge = compiledData.filter(a => Boolean(a));
+    const toMerge = compiledData.filter(a => a);
     if ( toMerge.length === 0 ) { return; }
     const merged = toMerge[0];
     while ( toMerge.length > 1 ) {
@@ -445,7 +464,7 @@ async function compileImportedList() {
 /******************************************************************************/
 
 async function compileSandboxFilters() {
-    const text = await chrome.runtime.sendMessage({
+    const text = await browser.runtime.sendMessage({
         what: 'compileFilters:getUserList'
     });
     if ( Boolean(text) === false ) { return; }
@@ -491,7 +510,7 @@ async function compileSandboxFilters() {
     if ( importedCompiled.dnrRules?.length ) {
         msg.imported.dnrRules = importedCompiled.dnrRules;
     }
-    chrome.runtime.sendMessage(msg);
+    browser.runtime.sendMessage(msg);
 })();
 
 /******************************************************************************/

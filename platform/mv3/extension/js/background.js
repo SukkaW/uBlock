@@ -65,8 +65,6 @@ import {
     hostnameFromMatch,
     hostnamesFromMatches,
     isScriptlet,
-    processDueJobs,
-    resetJobsAlarm,
 } from './utils.js';
 
 import {
@@ -94,6 +92,7 @@ import {
     getEnabledRulesets,
     getEnabledRulesetsDetails,
     getRulesetDetails,
+    getRulesetRules,
     patchDefaultRulesets,
     setStrictBlockMode,
     updateDynamicAndSessionRules,
@@ -121,8 +120,17 @@ import {
     hasBroadHostPermissions,
 } from './ext-utils.js';
 
+import {
+    processDueJobs,
+    resetJobsAlarm,
+} from './alarms.js';
+
+import {
+    registerUserScripts,
+    updateCompiledFilters,
+} from './compiled-filters.js';
+
 import { dnr } from './ext-compat.js';
-import { registerCompiledFilters } from './compiled-filters.js';
 import { setPopupBlockMode } from './prevent-popup.js';
 import { supportsOffscreenDocument } from './ext-offscreen.js';
 import { toggleToolbarIcon } from './action.js';
@@ -226,30 +234,25 @@ onPermissionsChanged.pending = [];
 
 /******************************************************************************/
 
-async function registerDeclarativeAssets(
-    contentScripts = true,
-    userScripts = true,
-    userRules = true
-) {
-    const [ shouldUpdateUserRules ] = await Promise.all([
-        userScripts ? registerCompiledFilters() : false,
-        contentScripts ? registerContentScripts() : false,
-    ]);
-    if ( userRules && shouldUpdateUserRules ) {
-        await updateUserRules();
-    }
-}
-
-/******************************************************************************/
-
 async function applyRulesets(rulesets) {
     const result = await enableRulesets(rulesets);
     const stockUpdated = result.stockUpdated ?? false;
     const importedUpdated = result.importedUpdated ?? false;
-    if ( stockUpdated === false && importedUpdated === false ) { return; }
+    if ( (stockUpdated || importedUpdated) === false ) { return; }
     rulesetConfig.enabledRulesets = result.enabledRulesets;
     await saveRulesetConfig();
-    await registerDeclarativeAssets(stockUpdated, importedUpdated);
+    const promises = [];
+    if ( importedUpdated ) {
+        promises.push(
+            updateCompiledFilters().then(( ) =>
+                Promise.all([ registerUserScripts(), updateUserRules() ])
+            )
+        );
+    }
+    if ( stockUpdated ) {
+        promises.push(registerContentScripts());
+    }
+    await Promise.all(promises);
     broadcastMessage({ enabledRulesets: rulesetConfig.enabledRulesets });
 }
 
@@ -260,8 +263,6 @@ async function setDeveloperMode(state) {
     toggleDeveloperMode(rulesetConfig.developerMode);
     broadcastMessage({ developerMode: rulesetConfig.developerMode });
     await saveRulesetConfig();
-    await registerDeclarativeAssets(false, true, true);
-    await updateUserRules();
     return rulesetConfig.developerMode;
 }
 
@@ -429,6 +430,9 @@ async function onMessage(request, sender) {
     case 'getEnabledRulesetsDetails':
         return getEnabledRulesetsDetails();
 
+    case 'getRulesetRules':
+        return getRulesetRules(request.id);
+
     case 'hasBroadHostPermissions':
         return hasBroadHostPermissions();
 
@@ -492,7 +496,7 @@ async function onMessage(request, sender) {
         const beforeLevel = await getFilteringMode(request.hostname);
         if ( request.level === beforeLevel ) { return beforeLevel; }
         const afterLevel = await setFilteringMode(request.hostname, request.level);
-        await registerDeclarativeAssets();
+        await Promise.all([ registerContentScripts(), registerUserScripts() ]);
         return afterLevel;
     }
 
@@ -508,7 +512,7 @@ async function onMessage(request, sender) {
         const beforeLevel = await getDefaultFilteringMode();
         const afterLevel = await setDefaultFilteringMode(request.level);
         if ( afterLevel !== beforeLevel ) {
-            await registerDeclarativeAssets();
+            await Promise.all([ registerContentScripts(), registerUserScripts() ]);
         }
         return afterLevel;
     }
@@ -518,7 +522,7 @@ async function onMessage(request, sender) {
 
     case 'setFilteringModeDetails': {
         await setFilteringModeDetails(request.modes);
-        await registerDeclarativeAssets();
+        await Promise.all([ registerContentScripts(), registerUserScripts() ]);
         const defaultFilteringMode = await getDefaultFilteringMode();
         broadcastMessage({ defaultFilteringMode });
         return getFilteringModeDetails(true);
@@ -555,39 +559,76 @@ async function onMessage(request, sender) {
     case 'addCustomFilters': {
         const modified = await addCustomFilters(request.hostname, request.selectors);
         if ( modified !== true ) { return; }
-        return registerDeclarativeAssets(true,
-            request.selectors.some(a => isScriptlet(a))
-        );
+        const hasScriptletFilters = request.selectors.some(a => isScriptlet(a));
+        const hasPlainFilters = request.selectors.some(a => isScriptlet(a) === false);
+        const promises = [];
+        if ( hasPlainFilters ) {
+            promises.push(registerContentScripts());
+        }
+        if ( hasScriptletFilters ) {
+            promises.push(
+                updateCompiledFilters().then(( ) => registerUserScripts())
+            );
+        }
+        await Promise.all(promises);
+        return;
     }
 
     case 'addManyCustomFilters': {
         const promises = [];
         let hasScriptletFilters = false;
+        let hasPlainFilters = false;
         for ( const [ hostname, selectors ] of request.entries ) {
             if ( typeof hostname !== 'string' ) { continue; }
             if ( hostname === '' ) { continue; }
             if ( Array.isArray(selectors) === false ) { continue; }
             if ( selectors.length === 0 ) { continue; }
             hasScriptletFilters ||= selectors.some(a => isScriptlet(a));
+            hasPlainFilters ||= selectors.some(a => isScriptlet(a) === false);
             promises.push(addCustomFilters(hostname, selectors));
         }
         const results = await Promise.all(promises);
         if ( results.some(a => a) === false ) { return; }
-        return registerDeclarativeAssets(true, hasScriptletFilters);
+        promises.length = 0;
+        if ( hasPlainFilters ) {
+            promises.push(registerContentScripts());
+        }
+        if ( hasScriptletFilters ) {
+            promises.push(
+                updateCompiledFilters().then(( ) => registerUserScripts())
+            );
+        }
+        await Promise.all(promises);
+        return;
     }
 
     case 'removeCustomFilters': {
-        const modified = await removeCustomFilters(request.hostname, request.selectors);
+        const { selectors } = request;
+        const modified = await removeCustomFilters(request.hostname, selectors);
         if ( modified !== true ) { return; }
-        return registerDeclarativeAssets(true,
-            request.selectors.some(a => isScriptlet(a))
-        );
+        const hasScriptletFilters = selectors.some(a => isScriptlet(a));
+        const hasPlainFilters = selectors.some(a => isScriptlet(a) === false);
+        const promises = [];
+        if ( hasPlainFilters ) {
+            promises.push(registerContentScripts());
+        }
+        if ( hasScriptletFilters ) {
+            promises.push(
+                updateCompiledFilters().then(( ) => registerUserScripts())
+            );
+        }
+        await Promise.all(promises);
+        return;
     }
 
     case 'removeAllCustomFilters': {
         const modified = await removeAllCustomFilters(request.hostname);
         if ( modified !== true ) { return; }
-        return registerDeclarativeAssets();
+        await Promise.all([
+            registerContentScripts(),
+            updateCompiledFilters().then(( ) => registerUserScripts()),
+        ]);
+        return;
     }
 
     case 'getSandboxFilters':
@@ -595,7 +636,9 @@ async function onMessage(request, sender) {
 
     case 'setSandboxFilters': {
         await setSandboxFilters(request.text);
-        return registerDeclarativeAssets(false);
+        await updateCompiledFilters();
+        await Promise.all([ registerUserScripts(), updateUserRules() ]);
+        return;
     }
 
     case 'customFiltersFromHostname':
@@ -612,26 +655,30 @@ async function onMessage(request, sender) {
         if ( modified !== true ) { break; }
         const rulesets = await getEnabledRulesets();
         rulesets.push(request.url);
-        applyRulesets(rulesets);
-        if ( modified ) {
-            return registerDeclarativeAssets(false);
-        }
-        break;
+        await applyRulesets(rulesets);
+        return;
     }
 
-    case 'getImportedLists': {   
+    case 'getImportedLists': {
         return getImportedLists();
     }
 
     case 'updateImportedLists': {
         const count = await updateImportedLists();
         if ( count === 0 ) { break; }
-        return registerDeclarativeAssets(false);
+        await updateCompiledFilters();
+        await Promise.all([ registerUserScripts(), updateUserRules() ]);
+        return;
     }
 
-    case 'pruneCSSCache': {   
+    case 'pruneCSSCache': {
         return pruneCSSCache();
     }
+
+    // This is used to ensure we are not suspended while busy fetching filter
+    // lists from remote servers.
+    case 'keepAlive':
+        return;
 
     default:
         break;
@@ -720,17 +767,25 @@ async function startSession() {
     // "When an extension updates, content scripts are cleared"
     // https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/API/userScripts#extension_updates
     // "User scripts are cleared when an extension updates"
+    const promises = [];
     const shouldInject = isNewVersion || permissionsUpdated ||
         isSideloaded && rulesetConfig.developerMode;
-    if ( shouldInject || stockUpdated || importedUpdated ) {
-        await registerDeclarativeAssets(
-            shouldInject || stockUpdated,
-            shouldInject || importedUpdated || userScriptsChanged,
-            false
+    if ( shouldInject || stockUpdated ) {
+        promises.push(registerContentScripts());
+    }
+    if ( importedUpdated ) {
+        promises.push(
+            updateCompiledFilters().then(( ) =>
+                Promise.all([ registerUserScripts(), updateUserRules() ])
+            )
         );
-        if ( importedUpdated ) {
-            await updateUserRules();
-        }
+    } else if ( shouldInject ) {
+        promises.push(registerUserScripts(), updateUserRules());
+    } else if ( userScriptsChanged ) {
+        promises.push(registerUserScripts());
+    }
+    if ( promises.length ) {
+        await Promise.all(promises);
     }
 
     // Cosmetic filtering-related content scripts cache fitlering data in
@@ -844,7 +899,8 @@ browser.commands.onCommand.addListener((...args) => {
 browser.alarms.onAlarm.addListener(alarm => {
     if ( alarm.name !== 'deferredJobs' ) { return; }
     isFullyInitialized.then(( ) => {
-        if ( process.wakeupRun === false ) {
+        if ( process.wakeupRun === false && process.firstAlarm !== true ) {
+            process.firstAlarm = true;
             return resetJobsAlarm();
         }
         processDueJobs(onMessage);
